@@ -1,0 +1,12 @@
+Repository: ghostlinkd
+Version: 0.10
+Section: text
+Priority: optional
+Maintainer: Henrik Levkowetz <henrik@grenache.tools.ietf.org>
+Package: ghostlinkd
+Architecture: any
+Depends: 
+Ietf:
+Url:
+Repository: 
+Description: 

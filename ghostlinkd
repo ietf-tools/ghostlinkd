@@ -1,0 +1,445 @@
+#!/usr/bin/python
+# -*- python -*-
+
+"""
+NAME
+	%(program)s - Monitor and maintain an aggregate symlink directory.
+
+SYNOPSIS
+	%(program)s [OPTIONS]
+
+DESCRIPTION
+
+        %(program)s will first scan, and then continuously monitor a list of
+        source directories, in order to keep a target directory updated with
+        symlinks to the aggregated content of the source directories, in
+        priority order.  By default it goes to the background as a daemon, but
+        it can be made to run in the foreground.
+
+        In order to do its work it uses the inotify interface of Linux kernel
+        2.6.13 and later. It will not work if the inotify interface is absent.
+
+        Example: Let's say that you have the source directory list:
+        ["/foo/a/", "/bar/b/", "/baz/c/"]; and a target directory "/fum/t/".
+        If the contents of the source directories are:
+
+            /foo/a/
+                xx
+                xy
+                xz
+                
+            /bar/b/
+                xx
+                yy
+                zz
+
+            /baz/c/
+                xy
+                yy
+                yz
+
+        then the target directory will be made to contain the following:
+
+            /fum/t/
+                xx -> /foo/a/xx
+                xy -> /foo/a/xy
+                xz -> /foo/a/xz
+                yy -> /bar/b/yy
+                yz -> /baz/c/yz
+                zz -> /bar/b/zz
+
+        Note that xx, which occurs in both /foo/a/ and /bar/b/, is linked to
+        /foo/a/ because that occurs before /bar/b/ in the source list; and in
+        the same manner, yy is linked to /bar/b/yy rather than /baz/c/yy
+        because /bar/b/ occurs before /baz/c/ in the source list.
+
+%(options)s
+
+FILES
+        %(program)s reads its configuration from the following files (if found),
+        in the given order:
+        
+            <bin-dir>/%(program)s.conf
+            /etc/%(program)s.conf
+            /etc/%(program)s/%(program)s.conf
+            ~/.%(program)src
+
+        where <bin-dir> is the directory where %(program)s is installed.
+
+AUTHOR
+	Written by Henrik Levkowetz, <henrik@levkowetz.com>. Uses the
+        daemonize module from Chad J. Schroeder, from the Python Cookbook at
+        http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/278731.
+
+
+COPYRIGHT
+	Copyright 2011 Henrik Levkowetz. All rights reserved.
+
+        Redistribution and use in source and binary forms, with or without
+        modification, are permitted provided that the following conditions are
+        met:
+
+        * Redistributions of source code must retain the above copyright
+          notice, this list of conditions and the following disclaimer.
+
+        * Redistributions in binary form must reproduce the above copyright
+          notice, this list of conditions and the following disclaimer in the
+          documentation and/or other materials provided with the distribution.
+
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+        AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+        LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+        A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+        HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+        SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+        LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+        DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+        THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+        (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+        OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+import re
+import sys
+import os.path
+import getopt
+import config
+import StringIO
+import syslog
+
+# ------------------------------------------------------------------------------
+# Misc. metadata
+
+version = "0.10"
+program = os.path.basename(sys.argv[0])
+progdir = os.path.dirname(sys.argv[0])
+progpath= os.path.abspath(__file__)
+
+# ------------------------------------------------------------------------------
+# Set up logging
+
+syslog.openlog(program, syslog.LOG_PID)
+log = syslog.syslog
+
+# ------------------------------------------------------------------------------
+# Read config file
+
+
+merger = config.ConfigMerger(lambda x, y, z: "overwrite")
+
+default = """
+dry_run:        False
+batch:          False
+foreground:     False
+filepat:        None
+debug:          False
+verbose:        False
+ignore_hidden:  True
+"""
+
+default = StringIO.StringIO(default)
+conf = config.Config(default)
+
+for conffile in [progdir+"/"+program+".conf",
+                "/etc/"+program+".conf",
+                "/etc/"+program+"/"+program+".conf",
+                os.path.expanduser("~/."+program+"rc"),
+            ]:
+    if os.path.exists(conffile):
+        merger.merge(conf, config.Config(conffile))
+
+# ------------------------------------------------------------------------------
+# Create list of options, for the help text
+
+options = ""
+for line in re.findall("\n +(if|elif) +opt in \[(.+)\]:\s+#(.+)\n", open(sys.argv[0]).read()):
+    if not options:
+        options += "OPTIONS\n"
+    options += "        %-16s %s\n" % (line[1].replace('"', ''), line[2])
+options = options.strip()
+
+# ------------------------------------------------------------------------------
+# Process options
+
+# with ' < 1:' on the next line, this is a no-op:
+if len(sys.argv) < 1:
+    print __doc__ % locals()
+    sys.exit(1)
+
+try:
+    opts, args = getopt.gnu_getopt(sys.argv[1:], "bdfhin:s:t:vV", ["batch", "debug", "foreground", "ignore-hidden", "help", "name:", "source:", "target:", "verbose", "version", ])
+except Exception, e:
+    print "%s: %s" % (program, e)
+    sys.exit(1)
+
+# process option switches
+for opt, value in opts:
+    if not opt:
+        pass
+    elif opt in ["-b", "--batch"]:      # Only run initial scan and update, then exit.  Implies -f
+        conf.batch = True
+        conf.foreground = True
+    elif opt in ["-d", "--debug"]:      # Run with debug output
+        conf.debug = True
+        conf.verbose = True
+    elif opt in ["-f", "--foreground"]: # Run in the foreground, don't daemonize
+        conf.foreground = True
+    elif opt in ["-i", "--ignore-hidden"]: # Ignore file names starting with '.'
+        conf.ignore_hidden = True
+    elif opt in ["-n", "--dry-run"]: # Don't do anything, just show what would be done
+        conf.dry_run = True
+    elif opt in ["-p", "--pattern"]: # Only create symlinks for files matching NAME
+        conf.filepat = value
+    elif opt in ["-s", "--source"]: # Comma-separated list of source directories
+        conf.sourcedirs = value.strip().split(",")
+    elif opt in ["-t", "--target"]: # Target directory
+        conf.targetdir = value.strip()
+    elif   opt in ["-h", "--help"]:     # Output this help, then exit
+        print __doc__ % globals()
+        sys.exit(1)
+    elif   opt in ["-v", "--verbose"]:     # Be more verbose
+        conf.verbose = True
+    elif opt in ["-V", "--version"]:    # Output version, then exit
+        print program, version
+        sys.exit(0)
+
+# ----------------------------------------------------------------------
+# If we've come this far we weren't invoked just for help or version info, so
+# log the start.
+
+log("%(program)s v%(version)s starting (%(progpath)s)" % globals())
+
+# ----------------------------------------------------------------------
+def say(s):
+    log(s)
+    sys.stderr.write("%s\n" % (s))
+
+# ----------------------------------------------------------------------
+def note(s):
+    log(s)
+    if conf.verbose and conf.foreground:
+        sys.stderr.write("%s\n" % (s))
+
+# ----------------------------------------------------------------------
+def info(s):
+    if conf.debug:
+        note(s)
+        
+# ----------------------------------------------------------------------
+def err(s, error=1):
+    log("Error: %s" % s)
+    sys.stderr.write("\n%s: Error: %s\n\n" % (program, s))
+
+# ----------------------------------------------------------------------
+def die(s, error=1):
+    err(s)
+    log("Terminating")
+    sys.exit(error)
+
+# ------------------------------------------------------------------------------
+# Utility functions
+
+# def mkdir(path):
+#     if not path.exists():
+#         print "Creating directory '%s'" % path
+#         path.mkdir()
+#         return True
+#     return False
+# 
+# def mkfile(file):
+#     path = file.dirname()
+#     path.mkdir()
+#     if not file.exists():
+#         file.touch()
+#         return True
+#     return False
+
+import pwd
+import grp
+import daemonize
+from path import path as Path
+import pyinotify as inotify
+from pyinotify import WatchManager, Notifier, EventsCodes as EventCodes, ProcessEvent as EventHandler
+
+
+# ------------------------------------------------------------------------------
+
+note("Configuration:")
+for name in conf:
+    value = getattr(conf, name)
+    note("  %-14s: %-42s (%s)" % (name, value, type(value)))
+
+# ------------------------------------------------------------------------------
+# Some assertions
+if not Path(conf.targetdir).exists():
+    die("The directory '%s' where symlinks should be placed doesn't exist." % conf.targetdir)
+assert(type(conf.sourcedirs) in [ list, config.Sequence ])
+
+# ------------------------------------------------------------------------------
+note("Reading contents of source directories:")
+files = {}
+sources = []
+
+cwd = Path.getcwd()
+target = Path(conf.targetdir)
+if not target.isabs():
+    target = cwd / target
+note("targetdir: %s" % target)
+
+note("sourcedirs:")
+for dir in conf.sourcedirs:
+    dir = Path(dir.rstrip('/'))
+    if dir.islink():
+        note("sourcedir %s is a symlink, using %s instead" % (dir, dir.readlinkabs()))
+        dir = dir.readlinkabs()
+    if not dir.isabs():
+        dir = cwd / dir
+    if not dir in sources:
+        sources.append(dir)
+        note(" - %s" % dir)
+        files[dir] =  dir.listdir(conf.filepat)
+    else:
+        note(" - skipping %s, it's already in the source list" % dir)
+
+# ------------------------------------------------------------------------------
+
+def maybe_symlink(file, link):
+    if conf.ignore_hidden and file.name.startswith('.'):
+        note ("ignoring hidden file %s" % file)
+        return
+    if file.exists():
+        if link.exists():
+            old = link.readlinkabs()            
+            opath = old.parent
+            fpath = file.parent
+            # to avoid exceptions if one of these aren't in the source list,
+            # place what we're looking for as a sentinel at the end of the
+            # list:
+            if (sources+[fpath]).index(fpath) < (sources+[opath]).index(opath):
+                note("replacing %s -> %s" % (link, old))
+                if not conf.dry_run:
+                    link.unlink()
+                note("new symlink %s -> %s" % (link, file))
+                if not conf.dry_run:
+                    file.symlink(link)
+        else:
+            note("creating symlink %s -> %s" % (link, file))
+            if not conf.dry_run:
+                try:
+                    file.symlink(link)
+                except OSError, e:
+                    err("%s when trying to symlink %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+    else:
+        note("won't symlink; file doesn't exist: %s" % file)
+
+def maybe_unlink(file, link):
+    if conf.ignore_hidden and file.name.startswith('.'):
+        note ("ignoring hidden file %s" % file)
+        return
+    try:
+        old = link.readlinkabs()
+    except OSError: # the file is gone
+        old = None
+    if old == file or old == None:
+        note("unlinking %s -> %s" % (link, file))
+        if not conf.dry_run:
+            try:
+                link.unlink()
+            except OSError, e:
+                err(e)
+        # if we have the same file in another directory with lesser
+        # precedence than the one we just removed, we need to link that one
+        # in: 
+        if old:
+            for dir in sources:
+                file = dir/old.name
+                if file.exists():
+                    maybe_symlink(file, link)
+    else:
+        note("won't unlink: symlink didn't match: target was %s but %s -> %s" % (file, link, old))
+
+# ------------------------------------------------------------------------------
+# Maybe daemonize
+
+# Get user and group we should execute as
+user, pw, uid, gid, gecos, home, shell = list(pwd.getpwnam(conf.daemon_user))
+if "daemon_group" in conf:
+    group, gpw, gid, members = list(grp.getgrnam(conf.daemon_group))
+
+if not conf.foreground:
+    note("Daemonizing...")
+    pidfname = "/var/run/%s.pid" % program
+
+    pidfile = open(pidfname, "w")
+    os.chown(pidfile.name, uid, gid)
+    pidfile.close()
+
+    os.setgid(gid)
+    os.setuid(uid)
+    daemonize.createDaemon()
+
+    pidfile = open(pidfname, "w")
+    pidfile.write("%s" % os.getpid())
+    pidfile.close()
+
+    # Connect stdout and stderr to syslog, to catch messages, exceptions, traceback
+    log("Redirecting stdout and stderr to syslog")
+    syslog.write = syslog.syslog
+    sys.stdout = syslog
+    sys.stderr = syslog
+else:
+    note("Not daemonizing.")
+
+# ----------------------------------------------------------------------
+# Do the actual work
+
+
+for dir in sources:
+    for path in files[dir]:
+        name = path.name
+        src = dir / name
+        tgt = target / name
+        maybe_symlink(src, tgt)
+
+if conf.batch:
+    sys.exit(0)
+
+watchmgr = WatchManager()
+
+class EventHandler(EventHandler):
+    def process_IN_CREATE(self, event):
+        info( "Saw creation: %s" % event)
+        file = Path(event.pathname)
+        link = target / event.name
+        maybe_symlink(file, link)
+    def process_IN_DELETE(self, event):
+        info( "Saw deletion: %s" % event)
+        file = Path(event.pathname)
+        link = target / event.name
+        maybe_unlink(file, link)
+    def process_IN_MOVED_TO(self, event):
+        info( "Saw move to: %s" % event)
+        file = Path(event.pathname)
+        link = target / event.name
+        maybe_symlink(file, link)
+    def process_IN_MOVED_FROM(self, event):
+        info( "Saw move from: %s" % event)
+        file = Path(event.pathname)
+        link = target / event.name
+        maybe_unlink(file, link)
+
+handler = EventHandler()
+
+notifier = Notifier(watchmgr, handler)
+
+mask =  ( inotify.IN_CREATE |
+          inotify.IN_DELETE |
+          inotify.IN_MOVED_FROM |
+          inotify.IN_MOVED_TO
+        )
+
+for dir in sources:
+    watchmgr.add_watch(dir, mask=mask)
+
+note("Monitoring source directories for changes")
+notifier.loop()
