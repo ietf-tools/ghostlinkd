@@ -797,6 +797,7 @@ class path(_base):
     # --- Methods for querying the filesystem.
 
     exists = os.path.exists
+    lexists = os.path.lexists
     isdir = os.path.isdir
     isfile = os.path.isfile
     islink = os.path.islink

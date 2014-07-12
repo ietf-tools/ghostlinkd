@@ -110,7 +110,7 @@ import syslog
 # ------------------------------------------------------------------------------
 # Misc. metadata
 
-version = "0.10"
+version = "0.22"
 program = os.path.basename(sys.argv[0])
 progdir = os.path.dirname(sys.argv[0])
 progpath= os.path.abspath(__file__)
@@ -131,10 +131,17 @@ default = """
 dry_run:        False
 batch:          False
 foreground:     False
-filepat:        None
+file_pattern:   None
 debug:          False
 verbose:        False
-ignore_hidden:  True
+mappings: {
+    default: {
+        ignore_hidden:  True
+        file_pattern:   None
+        sources:        []
+        target:         None
+    }
+}
 """
 
 default = StringIO.StringIO(default)
@@ -167,7 +174,7 @@ if len(sys.argv) < 1:
     sys.exit(1)
 
 try:
-    opts, args = getopt.gnu_getopt(sys.argv[1:], "bdfhin:s:t:vV", ["batch", "debug", "foreground", "ignore-hidden", "help", "name:", "source:", "target:", "verbose", "version", ])
+    opts, args = getopt.gnu_getopt(sys.argv[1:], "bdfhins:t:vV", ["batch", "debug", "foreground", "ignore-hidden", "help", "name:", "sources:", "target:", "verbose", "version", ])
 except Exception, e:
     print "%s: %s" % (program, e)
     sys.exit(1)
@@ -189,11 +196,11 @@ for opt, value in opts:
     elif opt in ["-n", "--dry-run"]: # Don't do anything, just show what would be done
         conf.dry_run = True
     elif opt in ["-p", "--pattern"]: # Only create symlinks for files matching NAME
-        conf.filepat = value
-    elif opt in ["-s", "--source"]: # Comma-separated list of source directories
-        conf.sourcedirs = value.strip().split(",")
+        conf.file_pattern = value
+    elif opt in ["-s", "--sources"]: # Comma-separated list of source directories
+        conf.mappings.default.sources = value.strip().split(",")
     elif opt in ["-t", "--target"]: # Target directory
-        conf.targetdir = value.strip()
+        conf.mappings.default.target = value.strip()
     elif   opt in ["-h", "--help"]:     # Output this help, then exit
         print __doc__ % globals()
         sys.exit(1)
@@ -212,13 +219,13 @@ log("%(program)s v%(version)s starting (%(progpath)s)" % globals())
 # ----------------------------------------------------------------------
 def say(s):
     log(s)
-    sys.stderr.write("%s\n" % (s))
+    sys.stdout.write("%s\n" % (s))
 
 # ----------------------------------------------------------------------
 def note(s):
     log(s)
     if conf.verbose and conf.foreground:
-        sys.stderr.write("%s\n" % (s))
+        sys.stdout.write("%s\n" % (s))
 
 # ----------------------------------------------------------------------
 def info(s):
@@ -264,64 +271,28 @@ from pyinotify import WatchManager, Notifier, EventsCodes as EventCodes, Process
 
 # ------------------------------------------------------------------------------
 
-note("Configuration:")
-for name in conf:
-    value = getattr(conf, name)
-    note("  %-14s: %-42s (%s)" % (name, value, type(value)))
-
-# ------------------------------------------------------------------------------
-# Some assertions
-if not Path(conf.targetdir).exists():
-    die("The directory '%s' where symlinks should be placed doesn't exist." % conf.targetdir)
-assert(type(conf.sourcedirs) in [ list, config.Sequence ])
-
-# ------------------------------------------------------------------------------
-note("Reading contents of source directories:")
-files = {}
-sources = []
-
-cwd = Path.getcwd()
-target = Path(conf.targetdir)
-if not target.isabs():
-    target = cwd / target
-note("targetdir: %s" % target)
-
-note("sourcedirs:")
-for dir in conf.sourcedirs:
-    dir = Path(dir.rstrip('/'))
-    if dir.islink():
-        note("sourcedir %s is a symlink, using %s instead" % (dir, dir.readlinkabs()))
-        dir = dir.readlinkabs()
-    if not dir.isabs():
-        dir = cwd / dir
-    if not dir in sources:
-        sources.append(dir)
-        note(" - %s" % dir)
-        files[dir] =  dir.listdir(conf.filepat)
-    else:
-        note(" - skipping %s, it's already in the source list" % dir)
-
-# ------------------------------------------------------------------------------
-
-def maybe_symlink(file, link):
+def maybe_symlink(file, link, conf):
     if conf.ignore_hidden and file.name.startswith('.'):
         note ("ignoring hidden file %s" % file)
         return
     if file.exists():
-        if link.exists():
+        if link.lexists():
             old = link.readlinkabs()            
             opath = old.parent
             fpath = file.parent
             # to avoid exceptions if one of these aren't in the source list,
             # place what we're looking for as a sentinel at the end of the
             # list:
-            if (sources+[fpath]).index(fpath) < (sources+[opath]).index(opath):
-                note("replacing %s -> %s" % (link, old))
+            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists():
+                note("replacing   %s -> %s" % (link, old))
                 if not conf.dry_run:
                     link.unlink()
                 note("new symlink %s -> %s" % (link, file))
                 if not conf.dry_run:
                     file.symlink(link)
+            else:
+                # note("won't symlink; lower priority: %s << %s" % (opath, fpath))
+                pass
         else:
             note("creating symlink %s -> %s" % (link, file))
             if not conf.dry_run:
@@ -332,7 +303,7 @@ def maybe_symlink(file, link):
     else:
         note("won't symlink; file doesn't exist: %s" % file)
 
-def maybe_unlink(file, link):
+def maybe_unlink(file, link, conf):
     if conf.ignore_hidden and file.name.startswith('.'):
         note ("ignoring hidden file %s" % file)
         return
@@ -351,12 +322,64 @@ def maybe_unlink(file, link):
         # precedence than the one we just removed, we need to link that one
         # in: 
         if old:
-            for dir in sources:
+            for dir in conf.dirs:
                 file = dir/old.name
                 if file.exists():
-                    maybe_symlink(file, link)
+                    maybe_symlink(file, link, conf)
     else:
         note("won't unlink: symlink didn't match: target was %s but %s -> %s" % (file, link, old))
+
+# ------------------------------------------------------------------------------
+
+class EventHandler(EventHandler):
+    def __init__(self, pevent=None, **kwargs):
+        self.conf = kwargs["conf"]
+        return super(EventHandler, self).__init__(pevent, **kwargs)
+    def process_IN_CREATE(self, event):
+        info( "Saw creation: %s" % event)
+        file = Path(event.pathname)
+        link = section.target / event.name
+        maybe_symlink(file, link, self.conf)
+    def process_IN_DELETE(self, event):
+        info( "Saw deletion: %s" % event)
+        file = Path(event.pathname)
+        link = section.target / event.name
+        maybe_unlink(file, link, self.conf)
+    def process_IN_MOVED_TO(self, event):
+        info( "Saw move to: %s" % event)
+        file = Path(event.pathname)
+        link = section.target / event.name
+        maybe_symlink(file, link, self.conf)
+    def process_IN_MOVED_FROM(self, event):
+        info( "Saw move from: %s" % event)
+        file = Path(event.pathname)
+        link = section.target / event.name
+        maybe_unlink(file, link, self.conf)
+
+# ------------------------------------------------------------------------------
+
+note("Configuration:")
+for name in conf:
+    value = getattr(conf, name)
+    if name == "mappings":
+        for mname in conf.mappings:
+            mapping = conf.mappings[mname]
+            for n in mapping:
+                v = getattr(mapping, n)
+                note("  %-20s: %-36s (%s)" % ("%s.%s"%(mname, n), v, type(v)))
+    else:
+        # Set this value for all mappings which doesn't have it set
+        for mname in conf.mappings:
+            mapping = conf.mappings[mname]
+            if not hasattr(mapping, name):
+                setattr(mapping, name, value)
+        note("  %-14s: %-42s (%s)" % (name, value, type(value)))
+
+# ------------------------------------------------------------------------------
+# Some assertions
+#if not Path(conf.targetdir).exists():
+#    die("The directory '%s' where symlinks should be placed doesn't exist." % conf.targetdir)
+#assert(type(conf.masourcedirs) in [ list, config.Sequence ])
 
 # ------------------------------------------------------------------------------
 # Maybe daemonize
@@ -393,53 +416,69 @@ else:
 # ----------------------------------------------------------------------
 # Do the actual work
 
-
-for dir in sources:
-    for path in files[dir]:
-        name = path.name
-        src = dir / name
-        tgt = target / name
-        maybe_symlink(src, tgt)
-
-if conf.batch:
-    sys.exit(0)
-
-watchmgr = WatchManager()
-
-class EventHandler(EventHandler):
-    def process_IN_CREATE(self, event):
-        info( "Saw creation: %s" % event)
-        file = Path(event.pathname)
-        link = target / event.name
-        maybe_symlink(file, link)
-    def process_IN_DELETE(self, event):
-        info( "Saw deletion: %s" % event)
-        file = Path(event.pathname)
-        link = target / event.name
-        maybe_unlink(file, link)
-    def process_IN_MOVED_TO(self, event):
-        info( "Saw move to: %s" % event)
-        file = Path(event.pathname)
-        link = target / event.name
-        maybe_symlink(file, link)
-    def process_IN_MOVED_FROM(self, event):
-        info( "Saw move from: %s" % event)
-        file = Path(event.pathname)
-        link = target / event.name
-        maybe_unlink(file, link)
-
-handler = EventHandler()
-
-notifier = Notifier(watchmgr, handler)
-
 mask =  ( inotify.IN_CREATE |
           inotify.IN_DELETE |
           inotify.IN_MOVED_FROM |
           inotify.IN_MOVED_TO
         )
 
-for dir in sources:
-    watchmgr.add_watch(dir, mask=mask)
+sections = []
+for name in conf.mappings:
+    section = conf.mappings[name]
+    note("Section %s:" % name)
+    section.target = Path(section.target)
+    if not section.target.isabs():
+        section.target = section.cwd / section.target
+    note("   target directory: %s" % section.target)
+    section.files = {}
+    section.dirs = []
+    section.cwd = Path.getcwd()
+    note("   reading contents of source directories: %s:" % name)
+    for dir in section.sources:
+        dir = Path(dir.rstrip('/'))
+        if dir.islink():
+            note("     source directory %s is a symlink, using %s instead" % (dir, dir.readlinkabs()))
+            dir = dir.readlinkabs()
+        if not dir.isabs():
+            dir = section.cwd / dir
+        if not dir in section.dirs:
+            section.dirs.append(dir)
+            note("   - %s" % dir)
+            section.files[dir] =  dir.listdir(section.file_pattern)
+        else:
+            note("   - skipping %s, it's already in the source list" % dir)
+    for dir in section.dirs:
+        for path in section.files[dir]:
+            name = path.name
+            src = dir / name
+            tgt = section.target / name
+            maybe_symlink(src, tgt, section)
 
+    if not conf.batch:
+        section.handler = EventHandler(conf=section)
+        section.watchmgr = WatchManager()
+        for dir in section.dirs:
+            section.watchmgr.add_watch(dir, mask=mask)
+        section.notifier = Notifier(section.watchmgr, section.handler)
+        sections.append(section)
+
+if conf.batch:
+    sys.exit(0)
+   
 note("Monitoring source directories for changes")
-notifier.loop()
+while 1:
+    try:
+        for section in sections:
+            if section.notifier.check_events(timeout=100):
+                section.notifier.read_events()
+            section.notifier.process_events()
+
+    except KeyboardInterrupt:
+        # Stop monitoring if sigint is caught (Control-C).
+        log.debug('Pyinotify stops monitoring.')
+        break
+
+# Close internals
+for section in sections:
+    section.handler.stop()
+

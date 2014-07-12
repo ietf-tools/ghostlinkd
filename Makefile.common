@@ -12,7 +12,7 @@ language:= $(shell head -1 $(tool) | awk '{ sub("^.+/", "", $$1); print $$1; }')
 logentry := $(shell sed -n -r "/^$(tool) \($(version).*\)/,/^ -- /p" changelog | head -n -1 | sed -r 's/"/\\"/g' )
 
 # Sources
-sources	+= $(tool) copyright control.in changelog todo template.shtml.pyht Makefile ../Makefile.common
+sources	+= $(tool) copyright control.in changelog Makefile Makefile.common
 
 # Webpages
 webpages += index.shtml code.shtml copyright.shtml changelog.shtml
