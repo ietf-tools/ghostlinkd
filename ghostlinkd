@@ -56,8 +56,8 @@ DESCRIPTION
 %(options)s
 
 FILES
-        %(program)s reads its configuration from the following files (if found),
-        in the given order:
+        %(program)s reads its configuration from the following files (if
+        found), in the given order:
         
             <bin-dir>/%(program)s.conf
             /etc/%(program)s.conf
@@ -86,8 +86,8 @@ COPYRIGHT
           notice, this list of conditions and the following disclaimer in the
           documentation and/or other materials provided with the distribution.
 
-        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-        AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+        THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+        "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
         LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
         A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
         HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
@@ -110,7 +110,7 @@ import syslog
 # ------------------------------------------------------------------------------
 # Misc. metadata
 
-version = "0.22"
+version = "0.30"
 program = os.path.basename(sys.argv[0])
 progdir = os.path.dirname(sys.argv[0])
 progpath= os.path.abspath(__file__)
@@ -118,7 +118,7 @@ progpath= os.path.abspath(__file__)
 # ------------------------------------------------------------------------------
 # Set up logging
 
-syslog.openlog(program, syslog.LOG_PID)
+syslog.openlog(program, syslog.LOG_USER | syslog.LOG_PID)
 log = syslog.syslog
 
 # ------------------------------------------------------------------------------
@@ -127,25 +127,27 @@ log = syslog.syslog
 
 merger = config.ConfigMerger(lambda x, y, z: "overwrite")
 
-default = """
+default_conf = """
 dry_run:        False
 batch:          False
 foreground:     False
 file_pattern:   None
 debug:          False
 verbose:        False
+report:         False
 mappings: {
     default: {
         ignore_hidden:  True
         file_pattern:   None
+        use_hardlinks:  False
         sources:        []
         target:         None
     }
 }
 """
 
-default = StringIO.StringIO(default)
-conf = config.Config(default)
+default = config.Config(StringIO.StringIO(default_conf))
+conf    = config.Config(StringIO.StringIO(default_conf))
 
 for conffile in [progdir+"/"+program+".conf",
                 "/etc/"+program+".conf",
@@ -174,7 +176,7 @@ if len(sys.argv) < 1:
     sys.exit(1)
 
 try:
-    opts, args = getopt.gnu_getopt(sys.argv[1:], "bdfhins:t:vV", ["batch", "debug", "foreground", "ignore-hidden", "help", "name:", "sources:", "target:", "verbose", "version", ])
+    opts, args = getopt.gnu_getopt(sys.argv[1:], "bc:dfhinrvV", ["batch", "config:", "debug", "foreground", "ignore-hidden", "help", "report", "verbose", "version", ])
 except Exception, e:
     print "%s: %s" % (program, e)
     sys.exit(1)
@@ -183,9 +185,11 @@ except Exception, e:
 for opt, value in opts:
     if not opt:
         pass
-    elif opt in ["-b", "--batch"]:      # Only run initial scan and update, then exit.  Implies -f
+    elif opt in ["-b", "--batch"]:      # Only run initial scan and update.  Implies -f
         conf.batch = True
         conf.foreground = True
+    elif opt in ["-c", "--config"]:
+        merger.merge(conf, config.Config(value))
     elif opt in ["-d", "--debug"]:      # Run with debug output
         conf.debug = True
         conf.verbose = True
@@ -195,12 +199,11 @@ for opt, value in opts:
         conf.ignore_hidden = True
     elif opt in ["-n", "--dry-run"]: # Don't do anything, just show what would be done
         conf.dry_run = True
-    elif opt in ["-p", "--pattern"]: # Only create symlinks for files matching NAME
-        conf.file_pattern = value
-    elif opt in ["-s", "--sources"]: # Comma-separated list of source directories
-        conf.mappings.default.sources = value.strip().split(",")
-    elif opt in ["-t", "--target"]: # Target directory
-        conf.mappings.default.target = value.strip()
+    elif opt in ["-r", "--report"]: # Show existing links
+        conf.report = True
+        conf.batch  = True
+        conf.foreground = True
+    # stock switches
     elif   opt in ["-h", "--help"]:     # Output this help, then exit
         print __doc__ % globals()
         sys.exit(1)
@@ -235,7 +238,7 @@ def info(s):
 # ----------------------------------------------------------------------
 def err(s, error=1):
     log("Error: %s" % s)
-    sys.stderr.write("\n%s: Error: %s\n\n" % (program, s))
+    sys.stderr.write("%s: Error: %s\n\n" % (program, s))
 
 # ----------------------------------------------------------------------
 def die(s, error=1):
@@ -271,37 +274,66 @@ from pyinotify import WatchManager, Notifier, EventsCodes as EventCodes, Process
 
 # ------------------------------------------------------------------------------
 
+
+def follow(link, conf):
+    """Return the file that the link corresponds to.
+    If link is a symlink, this is rather trivial; we use readlink() and
+    abspath() if necessary.  If this is a hard link, we need to compare
+    the inode of the link with the inode of each of the possible sources,
+    and return the right one.
+    """
+    if link.islink():
+        #note("   link is symlink to %s" % link.readlinkabs())
+        return link.readlinkabs()
+    else:
+        inode = link.stat().st_ino
+        base  = link.basename()
+        for dir in conf.dirs:
+            file = dir / base
+            if file.exists() and file.stat().st_ino == inode:
+                #note("   link is hard link to %s" % file)
+                return file
+        #note("   link source not found")
+        return link
+
 def maybe_symlink(file, link, conf):
     if conf.ignore_hidden and file.name.startswith('.'):
         note ("ignoring hidden file %s" % file)
         return
     if file.exists():
         if link.lexists():
-            old = link.readlinkabs()            
+            old = follow(link, conf)
             opath = old.parent
             fpath = file.parent
             # to avoid exceptions if one of these aren't in the source list,
             # place what we're looking for as a sentinel at the end of the
             # list:
-            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists():
+            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or (link.islink() == conf.use_hardlinks):
                 note("replacing   %s -> %s" % (link, old))
                 if not conf.dry_run:
                     link.unlink()
-                note("new symlink %s -> %s" % (link, file))
+                note("new %s %s -> %s" % (("hard link" if conf.use_hardlinks else "symlink"), link, file))
                 if not conf.dry_run:
-                    file.symlink(link)
+                    if conf.use_hardlinks:
+                        file.link(link)
+                    else:
+                        file.symlink(link)
             else:
                 # note("won't symlink; lower priority: %s << %s" % (opath, fpath))
                 pass
         else:
-            note("creating symlink %s -> %s" % (link, file))
+            note("creating %s %s -> %s" % (("hard link" if conf.use_hardlinks else "symlink"), link, file))
             if not conf.dry_run:
                 try:
-                    file.symlink(link)
+                    if conf.use_hardlinks:
+                        file.link(link)
+                    else:
+                        file.symlink(link)
                 except OSError, e:
-                    err("%s when trying to symlink %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+                    err("%s when trying to %s %s -> %s as %s" % (e, ("hard link" if conf.use_hardlings else "symlink"), link, file, pwd.getpwuid(os.getuid())[0]))
     else:
-        note("won't symlink; file doesn't exist: %s" % file)
+        note("won't link; file doesn't exist: %s" % file)
+
 
 def maybe_unlink(file, link, conf):
     if conf.ignore_hidden and file.name.startswith('.'):
@@ -364,6 +396,9 @@ for name in conf:
     if name == "mappings":
         for mname in conf.mappings:
             mapping = conf.mappings[mname]
+            for dname in default.mappings.default:
+                if not dname in mapping:
+                    mapping[dname] = default.mappings.default[dname]
             for n in mapping:
                 v = getattr(mapping, n)
                 note("  %-20s: %-36s (%s)" % ("%s.%s"%(mname, n), v, type(v)))
@@ -427,13 +462,17 @@ for name in conf.mappings:
     section = conf.mappings[name]
     note("Section %s:" % name)
     section.target = Path(section.target)
+    section.cwd = Path.getcwd()
     if not section.target.isabs():
         section.target = section.cwd / section.target
-    note("   target directory: %s" % section.target)
+    if not section.target.exists():
+        note("   creating target directory: %s" % section.target)
+        section.target.makedirs(mode=0o755)
+    else:
+        note("   target directory: %s" % section.target)
     section.files = {}
     section.dirs = []
-    section.cwd = Path.getcwd()
-    note("   reading contents of source directories: %s:" % name)
+    note("   reading contents of source directories:")
     for dir in section.sources:
         dir = Path(dir.rstrip('/'))
         if dir.islink():
@@ -447,20 +486,34 @@ for name in conf.mappings:
             section.files[dir] =  dir.listdir(section.file_pattern)
         else:
             note("   - skipping %s, it's already in the source list" % dir)
-    for dir in section.dirs:
-        for path in section.files[dir]:
-            name = path.name
-            src = dir / name
-            tgt = section.target / name
-            maybe_symlink(src, tgt, section)
+    if conf.report:
+        if not conf.verbose:
+            sys.stdout.write("\nSection %s: %s:\n" % (name, section.target))
+        for file in section.target.listdir():
+            if file.islink():
+                sys.stdout.write("   %s -> %s\n" % (file, follow(file, section)))
+            else:
+                sys.stdout.write("   %s == %s\n" % (file, follow(file, section)))
+        continue
 
     if not conf.batch:
+        note("   setting up watchers and event handlers to monitor source directories")
         section.handler = EventHandler(conf=section)
         section.watchmgr = WatchManager()
         for dir in section.dirs:
             section.watchmgr.add_watch(dir, mask=mask)
         section.notifier = Notifier(section.watchmgr, section.handler)
         sections.append(section)
+
+    note("   inspecting directories and updating links as needed")
+    for dir in section.dirs:
+        note("   - %s: %s files" % (dir, len(section.files[dir])))
+        for path in section.files[dir]:
+            name = path.name
+            src = dir / name
+            tgt = section.target / name
+            maybe_symlink(src, tgt, section)
+
 
 if conf.batch:
     sys.exit(0)
