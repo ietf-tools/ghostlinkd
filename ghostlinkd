@@ -139,7 +139,7 @@ mappings: {
     default: {
         ignore_hidden:  True
         file_pattern:   None
-        use_hardlinks:  False
+        action:  symlink
         sources:        []
         target:         None
     }
@@ -302,35 +302,74 @@ def maybe_symlink(file, link, conf):
         return
     if file.exists():
         if link.lexists():
-            old = follow(link, conf)
+            old = link.readlinkabs()
             opath = old.parent
             fpath = file.parent
             # to avoid exceptions if one of these aren't in the source list,
             # place what we're looking for as a sentinel at the end of the
             # list:
-            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or (link.islink() == conf.use_hardlinks):
-                note("replacing   %s -> %s" % (link, old))
+            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or not link.islink():
+                note("replacing old link %s -> %s" % (link, old))
                 if not conf.dry_run:
                     link.unlink()
-                note("new %s %s -> %s" % (("hard link" if conf.use_hardlinks else "symlink"), link, file))
+                note("new symlink %s -> %s" % (link, file))
                 if not conf.dry_run:
-                    if conf.use_hardlinks:
-                        file.link(link)
-                    else:
-                        file.symlink(link)
+                    file.symlink(link)
             else:
                 # note("won't symlink; lower priority: %s << %s" % (opath, fpath))
                 pass
         else:
-            note("creating %s %s -> %s" % (("hard link" if conf.use_hardlinks else "symlink"), link, file))
+            note("creating symlink %s -> %s" % (link, file))
             if not conf.dry_run:
                 try:
-                    if conf.use_hardlinks:
-                        file.link(link)
-                    else:
-                        file.symlink(link)
+                    file.symlink(link)
                 except OSError, e:
-                    err("%s when trying to %s %s -> %s as %s" % (e, ("hard link" if conf.use_hardlings else "symlink"), link, file, pwd.getpwuid(os.getuid())[0]))
+                    err("%s when trying to symlink %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+    else:
+        note("won't link; file doesn't exist: %s" % file)
+
+
+def maybe_hardlink(file, link, conf):
+    #
+    def resolve_hardlink(link, conf):
+        inode = link.stat().st_ino
+        base  = link.basename()
+        for dir in conf.dirs:
+            file = dir / base
+            if file.exists() and file.stat().st_ino == inode:
+                #note("   link is hard link to %s" % file)
+                return file
+        #note("   link source not found")
+        return link
+
+    if conf.ignore_hidden and file.name.startswith('.'):
+        note ("ignoring hidden file %s" % file)
+        return
+    if file.exists():
+        if link.lexists():
+            old = resolve_hardlink(link, conf)
+            opath = old.parent
+            fpath = file.parent
+            # to avoid exceptions if one of these aren't in the source list,
+            # place what we're looking for as a sentinel at the end of the
+            # list:
+            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or link.islink():
+                note("replacing   %s -> %s" % (link, old))
+                if not conf.dry_run:
+                    link.unlink()
+                note("new hard link %s -> %s" % (link, file))
+                if not conf.dry_run:
+                    file.link(link)
+            else:
+                # note("won't link; lower priority: %s << %s" % (opath, fpath))
+                pass
+        else:
+            note("creating hard link %s -> %s" % (link, file))
+            if not conf.dry_run:
+                try:
+                    file.link(link)
+                except OSError, e:
+                    err("%s when trying to hard link %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
     else:
         note("won't link; file doesn't exist: %s" % file)
 
@@ -357,7 +396,7 @@ def maybe_unlink(file, link, conf):
             for dir in conf.dirs:
                 file = dir/old.name
                 if file.exists():
-                    maybe_symlink(file, link, conf)
+                    conf.action(file, link, conf)
     else:
         note("won't unlink: symlink didn't match: target was %s but %s -> %s" % (file, link, old))
 
@@ -370,44 +409,55 @@ class EventHandler(EventHandler):
     def process_IN_CREATE(self, event):
         info( "Saw creation: %s" % event)
         file = Path(event.pathname)
-        link = section.target / event.name
-        maybe_symlink(file, link, self.conf)
+        link = self.conf.target / event.name
+        self.conf.action(file, link, self.conf)
     def process_IN_DELETE(self, event):
         info( "Saw deletion: %s" % event)
         file = Path(event.pathname)
-        link = section.target / event.name
+        link = self.conf.target / event.name
         maybe_unlink(file, link, self.conf)
     def process_IN_MOVED_TO(self, event):
         info( "Saw move to: %s" % event)
         file = Path(event.pathname)
-        link = section.target / event.name
-        maybe_symlink(file, link, self.conf)
+        link = self.conf.target / event.name
+        self.conf.action(file, link, self.conf)
     def process_IN_MOVED_FROM(self, event):
         info( "Saw move from: %s" % event)
         file = Path(event.pathname)
-        link = section.target / event.name
+        link = self.conf.target / event.name
         maybe_unlink(file, link, self.conf)
 
 # ------------------------------------------------------------------------------
+
+actions ={
+    "symlink": maybe_symlink,
+    "hardlink": maybe_hardlink,
+#    "command": do_command,
+}
 
 note("Configuration:")
 for name in conf:
     value = getattr(conf, name)
     if name == "mappings":
         for mname in conf.mappings:
-            mapping = conf.mappings[mname]
+            section = conf.mappings[mname]
             for dname in default.mappings.default:
-                if not dname in mapping:
-                    mapping[dname] = default.mappings.default[dname]
-            for n in mapping:
-                v = getattr(mapping, n)
+                if not dname in section:
+                    section[dname] = default.mappings.default[dname]
+            for n in section:
+                v = getattr(section, n)
                 note("  %-20s: %-36s (%s)" % ("%s.%s"%(mname, n), v, type(v)))
+            if section.action in actions:
+                note("  ** section.action: %s" % section.action)
+                section.action = actions[section.action]
+            else:
+                die("Unrecognized action in configuration: '%s'.  Possible actions are: %s" % (section.action, ", ".join(actions.keys())))
     else:
         # Set this value for all mappings which doesn't have it set
         for mname in conf.mappings:
-            mapping = conf.mappings[mname]
-            if not hasattr(mapping, name):
-                setattr(mapping, name, value)
+            section = conf.mappings[mname]
+            if not hasattr(section, name):
+                setattr(section, name, value)
         note("  %-14s: %-42s (%s)" % (name, value, type(value)))
 
 # ------------------------------------------------------------------------------
@@ -512,7 +562,7 @@ for name in conf.mappings:
             name = path.name
             src = dir / name
             tgt = section.target / name
-            maybe_symlink(src, tgt, section)
+            section.action(src, tgt, section)
 
 
 if conf.batch:
@@ -528,7 +578,7 @@ while 1:
 
     except KeyboardInterrupt:
         # Stop monitoring if sigint is caught (Control-C).
-        log.debug('Pyinotify stops monitoring.')
+        log('Pyinotify stops monitoring.')
         break
 
 # Close internals

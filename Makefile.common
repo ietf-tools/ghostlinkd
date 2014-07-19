@@ -71,6 +71,7 @@ binaries: $(binaries)
 # ----------------------------------------------------------------------
 test::
 	# Test suite
+	
 
 # ----------------------------------------------------------------------
 package: test archive archive/$(tool)-$(version).tgz archive/$(tool)-v$(version)

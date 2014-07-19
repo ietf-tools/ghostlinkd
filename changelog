@@ -1,3 +1,19 @@
+ghostlinkd (0.30)
+
+  * Added the ability to link using hard links if desired.  
+
+  * Added additional messages in verbose mode.  Added a --report option, in
+    order to be able to list where files are linked from when using hard
+    links.  
+
+  * Moved installation of watchers and event handlers so it is done before the
+    initial scan of directory content, so as to not miss changes taking place
+    during the initial scan.
+
+  * Removed some nonfunctional options
+
+ -- Henrik Levkowetz 2011-12-19 15:46:00 CET
+
 ghostlinkd (0.22)
 
   * The version deployed on the ietf server.
