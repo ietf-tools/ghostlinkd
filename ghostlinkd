@@ -110,7 +110,7 @@ import syslog
 # ------------------------------------------------------------------------------
 # Misc. metadata
 
-version = "0.30"
+version = "0.31"
 program = os.path.basename(sys.argv[0])
 progdir = os.path.dirname(sys.argv[0])
 progpath= os.path.abspath(__file__)
@@ -155,6 +155,10 @@ for conffile in [progdir+"/"+program+".conf",
                 os.path.expanduser("~/."+program+"rc"),
             ]:
     if os.path.exists(conffile):
+        if conf.verbose:
+            note("Reading configuration file '%s'" % os.path.abspath(conffile))
+        else:
+            log("Reading configuration file '%s'" % os.path.abspath(conffile))
         merger.merge(conf, config.Config(conffile))
 
 # ------------------------------------------------------------------------------
