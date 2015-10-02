@@ -274,7 +274,8 @@ import daemonize
 from path import path as Path
 import pyinotify as inotify
 from pyinotify import WatchManager, Notifier, EventsCodes as EventCodes, ProcessEvent as EventHandler
-
+import subprocess
+import shlex
 
 # ------------------------------------------------------------------------------
 
@@ -300,10 +301,7 @@ def follow(link, conf):
         #note("   link source not found")
         return link
 
-def maybe_symlink(file, link, conf):
-    if conf.ignore_hidden and file.name.startswith('.'):
-        note ("ignoring hidden file %s" % file)
-        return
+def symlink(file, link, conf):
     if file.exists() and not file.isdir():
         if link.lexists():
             old = link.readlinkabs()
@@ -333,7 +331,7 @@ def maybe_symlink(file, link, conf):
         note("won't link; file doesn't exist: %s" % file)
 
 
-def maybe_hardlink(file, link, conf):
+def hardlink(file, link, conf):
     #
     def resolve_hardlink(link, conf):
         inode = link.stat().st_ino
@@ -346,9 +344,6 @@ def maybe_hardlink(file, link, conf):
         #note("   link source not found")
         return link
 
-    if conf.ignore_hidden and file.name.startswith('.'):
-        note ("ignoring hidden file %s" % file)
-        return
     if file.exists() and not file.isdir():
         if link.lexists():
             old = resolve_hardlink(link, conf)
@@ -378,9 +373,8 @@ def maybe_hardlink(file, link, conf):
         note("won't link; file doesn't exist: %s" % file)
 
 
-def maybe_unlink(file, link, conf):
-    if conf.ignore_hidden and file.name.startswith('.'):
-        note ("ignoring hidden file %s" % file)
+def unlink(file, link, conf):
+    if not conf.action in batch_actions:
         return
     try:
         old = link.readlinkabs()
@@ -400,9 +394,26 @@ def maybe_unlink(file, link, conf):
             for dir in conf.dirs:
                 file = dir/old.name
                 if file.exists():
-                    conf.action(file, link, conf)
+                    if conf.ignore_hidden and file.name.startswith('.'):
+                        note ("ignoring hidden file %s" % file)
+                    else:
+                        conf.action(file, link, conf)
     else:
         note("won't unlink: symlink didn't match: target was %s but %s -> %s" % (file, link, old))
+
+def rsync(src, tgt, conf):
+    try:
+        if conf.foreground:
+            pin, pout, perr = sys.stdin, sys.stdout, sys.stderr
+        else:
+            pin, pout, perr = None, log, log
+        subprocess.call(conf.params + [src, tgt], stdin=pin, stdout=pout, stderr=perr)
+    except OSError as e:
+        err("%s when trying to rsync %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+
+def skip(src, tgt, conf):
+    return
+
 
 # ------------------------------------------------------------------------------
 
@@ -414,30 +425,43 @@ class EventHandler(EventHandler):
         info( "Saw creation: %s" % event)
         file = Path(event.pathname)
         link = self.conf.target / event.name
-        self.conf.action(file, link, self.conf)
+        self.conf.create(file, link, self.conf)
     def process_IN_DELETE(self, event):
         info( "Saw deletion: %s" % event)
         file = Path(event.pathname)
         link = self.conf.target / event.name
-        maybe_unlink(file, link, self.conf)
+        self.conf.delete(file, link, self.conf)
     def process_IN_MOVED_TO(self, event):
         info( "Saw move to: %s" % event)
         file = Path(event.pathname)
         link = self.conf.target / event.name
-        self.conf.action(file, link, self.conf)
+        self.conf.moveto(file, link, self.conf)
     def process_IN_MOVED_FROM(self, event):
         info( "Saw move from: %s" % event)
         file = Path(event.pathname)
         link = self.conf.target / event.name
-        maybe_unlink(file, link, self.conf)
+        self.conf.movefrom(file, link, self.conf)
+    def process_IN_CLOSE_WRITE(self, event):
+        info( "Saw modification: %s" % event)
+        file = Path(event.pathname)
+        link = self.conf.target / event.name
+        self.conf.modify(file, link, self.conf)
+
 
 # ------------------------------------------------------------------------------
 
-actions ={
-    "symlink": maybe_symlink,
-    "hardlink": maybe_hardlink,
-#    "command": do_command,
+actions = {
+    # action list:  (create, delete, move_to, move_from, modify):
+    "symlink":      (symlink,  unlink, symlink,  unlink, skip),
+    "hardlink":     (hardlink, unlink, hardlink, unlink, skip),
+    "rsync":        (rsync,    skip,   rsync,    skip,   rsync),
 }
+
+batch_actions  = [
+    symlink,
+    hardlink,
+]
+
 
 note("Configuration:")
 for name in conf:
@@ -445,15 +469,18 @@ for name in conf:
     if name == "mappings":
         for mname in conf.mappings:
             section = conf.mappings[mname]
+            params = shlex.split(section.action)
+            action = params[0]
             for dname in default.mappings.default:
                 if not dname in section:
                     section[dname] = default.mappings.default[dname]
             for n in section:
                 v = getattr(section, n)
                 note("  %-20s: %-36s (%s)" % ("%s.%s"%(mname, n), v, type(v)))
-            if section.action in actions:
-                note("  ** section.action: %s" % section.action)
-                section.action = actions[section.action]
+            if action in actions:
+                note("  ** section.action: %s" % action)
+                section.create, section.delete, section.moveto, section.movefrom, section.modify = actions[action]
+                section.params = params
             else:
                 die("Unrecognized action in configuration: '%s'.  Possible actions are: %s" % (section.action, ", ".join(actions.keys())))
     else:
@@ -508,7 +535,8 @@ else:
 mask =  ( inotify.IN_CREATE |
           inotify.IN_DELETE |
           inotify.IN_MOVED_FROM |
-          inotify.IN_MOVED_TO
+          inotify.IN_MOVED_TO |
+          inotify.IN_CLOSE_WRITE
         )
 
 sections = []
@@ -517,8 +545,11 @@ for name in conf.mappings:
     note("Section %s:" % name)
     section.target = Path(section.target)
     section.cwd = Path.getcwd()
-    if not section.target.isabs():
+    note("Making paths absolute")
+    note(section.target)
+    if not section.target.isabs() and not ':' in section.target:
         section.target = section.cwd / section.target
+    note(section.target)
     if not section.target.exists():
         note("   creating target directory: %s" % section.target)
         section.target.makedirs(mode=0o755)
@@ -561,12 +592,13 @@ for name in conf.mappings:
 
     note("   inspecting directories and updating links as needed")
     for dir in section.dirs:
-        note("   - %s: %s files" % (dir, len(section.files[dir])))
-        for path in section.files[dir]:
-            name = path.name
-            src = dir / name
-            tgt = section.target / name
-            section.action(src, tgt, section)
+        if section.action in batch_actions:
+            note("   - %s: %s files" % (dir, len(section.files[dir])))
+            for path in section.files[dir]:
+                name = path.name
+                src = dir / name
+                tgt = section.target / name
+                section.action(src, tgt, section)
 
 
 if conf.batch:
