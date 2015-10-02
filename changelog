@@ -1,3 +1,10 @@
+ghostlinkd (0.40)
+
+  * Added the ability to use rsync in addition to symlink and hardlink.
+
+ -- Henrik Levkowetz <henrik@levkowetz.com>  02 Oct 2015 3:20:29 +0200
+
+
 ghostlinkd (0.30)
 
   * Added the ability to link using hard links if desired.  

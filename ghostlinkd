@@ -12,9 +12,10 @@ DESCRIPTION
 
         %(program)s will first scan, and then continuously monitor a list of
         source directories, in order to keep a target directory updated with
-        symlinks to the aggregated content of the source directories, in
-        priority order.  By default it goes to the background as a daemon, but
-        it can be made to run in the foreground.
+        the aggregated content of the source directories, in priority order.
+        This is accomplished using one of the supported methods: symlinking,
+        hardlinking, or rsyncing.  By default it goes to the background as a
+        daemon, but it can be made to run in the foreground.
 
         In order to do its work it uses the inotify interface of Linux kernel
         2.6.13 and later. It will not work if the inotify interface is absent.
@@ -73,7 +74,7 @@ AUTHOR
 
 
 COPYRIGHT
-	Copyright 2011 Henrik Levkowetz. All rights reserved.
+	Copyright 2011, 2015 Henrik Levkowetz. All rights reserved.
 
         Redistribution and use in source and binary forms, with or without
         modification, are permitted provided that the following conditions are
@@ -110,7 +111,7 @@ import syslog
 # ------------------------------------------------------------------------------
 # Misc. metadata
 
-version = "0.31"
+version = "0.40"
 program = os.path.basename(sys.argv[0])
 progdir = os.path.dirname(sys.argv[0])
 progpath= os.path.abspath(__file__)
