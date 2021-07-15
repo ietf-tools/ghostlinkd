@@ -111,7 +111,7 @@ import syslog
 # ------------------------------------------------------------------------------
 # Misc. metadata
 
-version = "0.40"
+version = "0.40.2"
 program = os.path.basename(sys.argv[0])
 progdir = os.path.dirname(sys.argv[0])
 progpath= os.path.abspath(__file__)
@@ -304,30 +304,30 @@ def follow(link, conf):
 
 def symlink(file, link, conf):
     if file.exists() and not file.isdir():
-        if link.lexists():
-            old = link.readlinkabs()
-            opath = old.parent
-            fpath = file.parent
-            # to avoid exceptions if one of these aren't in the source list,
-            # place what we're looking for as a sentinel at the end of the
-            # list:
-            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or not link.islink():
-                note("replacing     %s -> %s" % (link, old))
-                if not conf.dry_run:
-                    link.unlink()
-                note("new symlink   %s -> %s" % (link, file))
-                if not conf.dry_run:
-                    file.symlink(link)
+        try:
+            if link.lexists():
+                old = link.readlinkabs()
+                opath = old.parent
+                fpath = file.parent
+                # to avoid exceptions if one of these aren't in the source list,
+                # place what we're looking for as a sentinel at the end of the
+                # list:
+                if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or not link.islink():
+                    note("replacing     %s -> %s" % (link, old))
+                    if not conf.dry_run:
+                        link.unlink()
+                    note("new symlink   %s -> %s" % (link, file))
+                    if not conf.dry_run:
+                        file.symlink(link)
+                else:
+                    # note("won't symlink; lower priority: %s << %s" % (opath, fpath))
+                    pass
             else:
-                # note("won't symlink; lower priority: %s << %s" % (opath, fpath))
-                pass
-        else:
-            note("creating symlink %s -> %s" % (link, file))
-            if not conf.dry_run:
-                try:
+                note("creating symlink %s -> %s" % (link, file))
+                if not conf.dry_run:
                     file.symlink(link)
-                except OSError, e:
-                    err("%s when trying to symlink %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+        except OSError, e:
+            err("%s when trying to symlink %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
     else:
         note("won't link; file doesn't exist: %s" % file)
 
@@ -346,41 +346,40 @@ def hardlink(file, link, conf):
         return link
 
     if file.exists() and not file.isdir():
-        if link.lexists():
-            old = resolve_hardlink(link, conf)
-            opath = old.parent
-            fpath = file.parent
-            # to avoid exceptions if one of these aren't in the source list,
-            # place what we're looking for as a sentinel at the end of the
-            # list:
-            if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or link.islink():
-                note("replacing     %s -> %s" % (link, old))
-                if not conf.dry_run:
-                    link.unlink()
-                note("new hard link %s == %s" % (link, file))
-                if not conf.dry_run:
-                    file.link(link)
+        try:
+            if link.lexists():
+                old = resolve_hardlink(link, conf)
+                opath = old.parent
+                fpath = file.parent
+                # to avoid exceptions if one of these aren't in the source list,
+                # place what we're looking for as a sentinel at the end of the
+                # list:
+                if (conf.dirs+[fpath]).index(fpath) < (conf.dirs+[opath]).index(opath) or not link.exists() or link.islink():
+                    note("replacing     %s -> %s" % (link, old))
+                    if not conf.dry_run:
+                        link.unlink()
+                    note("new hard link %s == %s" % (link, file))
+                    if not conf.dry_run:
+                        file.link(link)
+                else:
+                    # note("won't link; lower priority: %s << %s" % (opath, fpath))
+                    pass
             else:
-                # note("won't link; lower priority: %s << %s" % (opath, fpath))
-                pass
-        else:
-            note("creating hard link %s == %s" % (link, file))
-            if not conf.dry_run:
-                try:
+                note("creating hard link %s == %s" % (link, file))
+                if not conf.dry_run:
                     file.link(link)
-                except OSError, e:
-                    err("%s when trying to hard link %s == %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+        except OSError as e:
+            err("%s when trying to hard link %s == %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
     else:
         note("won't link; file doesn't exist: %s" % file)
 
 
 def unlink(file, link, conf):
-    if not conf.action in batch_actions:
-        return
     try:
         old = link.readlinkabs()
     except OSError: # the file is gone
         old = None
+    info('old: %s' % old)
     if old == file or old == None:
         note("unlinking %s -> %s" % (link, file))
         if not conf.dry_run:
@@ -398,19 +397,20 @@ def unlink(file, link, conf):
                     if conf.ignore_hidden and file.name.startswith('.'):
                         note ("ignoring hidden file %s" % file)
                     else:
-                        conf.action(file, link, conf)
+                        conf.create(file, link, conf)
     else:
         note("won't unlink: symlink didn't match: target was %s but %s -> %s" % (file, link, old))
 
 def rsync(src, tgt, conf):
     try:
+        note("rsyncing %s => %s" % (src, tgt))
         if conf.foreground:
             pin, pout, perr = sys.stdin, sys.stdout, sys.stderr
         else:
-            pin, pout, perr = None, log, log
+            pin, pout, perr = None, None, None
         subprocess.call(conf.params + [src, tgt], stdin=pin, stdout=pout, stderr=perr)
     except OSError as e:
-        err("%s when trying to rsync %s -> %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
+        err("%s when trying to rsync %s => %s as %s" % (e, link, file, pwd.getpwuid(os.getuid())[0]))
 
 def skip(src, tgt, conf):
     return
@@ -447,21 +447,17 @@ class EventHandler(EventHandler):
         file = Path(event.pathname)
         link = self.conf.target / event.name
         self.conf.modify(file, link, self.conf)
-
+    def stop(self):
+        pass
 
 # ------------------------------------------------------------------------------
 
 actions = {
-    # action list:  (create, delete, move_to, move_from, modify):
-    "symlink":      (symlink,  unlink, symlink,  unlink, skip),
-    "hardlink":     (hardlink, unlink, hardlink, unlink, skip),
-    "rsync":        (rsync,    skip,   rsync,    skip,   rsync),
+    # action list:  (setup,    create,   delete, moveto,   movefrom, modify):
+    "symlink":      (symlink,  symlink,  unlink, symlink,  unlink,   skip),
+    "hardlink":     (hardlink, hardlink, unlink, hardlink, unlink,   skip),
+    "rsync":        (skip,     rsync,    skip,   rsync,    skip,     rsync),
 }
-
-batch_actions  = [
-    symlink,
-    hardlink,
-]
 
 
 note("Configuration:")
@@ -480,7 +476,7 @@ for name in conf:
                 note("  %-20s: %-36s (%s)" % ("%s.%s"%(mname, n), v, type(v)))
             if action in actions:
                 note("  ** section.action: %s" % action)
-                section.create, section.delete, section.moveto, section.movefrom, section.modify = actions[action]
+                section.setup, section.create, section.delete, section.moveto, section.movefrom, section.modify = actions[action]
                 section.params = params
             else:
                 die("Unrecognized action in configuration: '%s'.  Possible actions are: %s" % (section.action, ", ".join(actions.keys())))
@@ -546,16 +542,19 @@ for name in conf.mappings:
     note("Section %s:" % name)
     section.target = Path(section.target)
     section.cwd = Path.getcwd()
-    note("Making paths absolute")
     note(section.target)
     if not section.target.isabs() and not ':' in section.target:
+        note("Making paths absolute")
         section.target = section.cwd / section.target
     note(section.target)
-    if not section.target.exists():
-        note("   creating target directory: %s" % section.target)
-        section.target.makedirs(mode=0o755)
+    if ':' in section.target:
+        note("   target host and directory: %s" % section.target)
     else:
-        note("   target directory: %s" % section.target)
+        if not section.target.exists():
+            note("   creating target directory: %s" % section.target)
+            section.target.makedirs(mode=0o755)
+        else:
+            note("   target directory: %s" % section.target)
     section.files = {}
     section.dirs = []
     note("   reading contents of source directories:")
@@ -593,13 +592,13 @@ for name in conf.mappings:
 
     note("   inspecting directories and updating links as needed")
     for dir in section.dirs:
-        if section.action in batch_actions:
+        if section.setup and (section.setup != skip):
             note("   - %s: %s files" % (dir, len(section.files[dir])))
             for path in section.files[dir]:
                 name = path.name
                 src = dir / name
                 tgt = section.target / name
-                section.action(src, tgt, section)
+                section.setup(src, tgt, section)
 
 
 if conf.batch:
